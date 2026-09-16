@@ -1542,6 +1542,73 @@ def oranlari_parse(
     return sonuc
 
 
+def _ondalik_oran_sayisi(deger):
+    """Oran alanını güvenli şekilde ondalık sayıya çevirir."""
+    try:
+        return float(str(deger).replace(",", ".").strip())
+    except Exception:
+        return None
+
+
+def oran_pazar_olasiligi(odds_parsed, pazar_turu):
+    """Bookmaker oranlarından marjı normalize edilmiş piyasa olasılığı üretir.
+
+    Birden fazla bookmaker varsa medyan oran kullanılır. Böylece tek bir
+    uç oranın modeli gereksiz yere etkilemesi azaltılır.
+    """
+    if not odds_parsed:
+        return None
+
+    adaylar = []
+    for bet_name, values in odds_parsed.items():
+        low = str(bet_name or "").lower()
+        if pazar_turu == "ms" and not any(x in low for x in ("match winner", "1x2", "fulltime result")):
+            continue
+        if pazar_turu == "ou25" and not ("over/under" in low or "goals over/under" in low or "goals" in low and "over" in low):
+            continue
+        if pazar_turu == "btts" and not ("both teams" in low or "both teams to score" in low or "btts" in low):
+            continue
+        adaylar.append(values)
+
+    if not adaylar:
+        return None
+
+    # İlk eşleşen marketi kullan; oranlari_parse zaten bookmakerları aynı markette topluyor.
+    values = adaylar[0]
+    odds_by_key = {}
+    for item in values:
+        value = str(item.get("value", "")).strip().lower()
+        odd = _ondalik_oran_sayisi(item.get("odd"))
+        if odd is None or odd <= 1.0 or odd > 100.0:
+            continue
+        odds_by_key.setdefault(value, []).append(odd)
+
+    if pazar_turu == "ms":
+        anahtarlar = {"home": "home", "draw": "draw", "away": "away"}
+    elif pazar_turu == "ou25":
+        anahtarlar = {"over 2.5": "over", "under 2.5": "under"}
+    else:
+        anahtarlar = {"yes": "yes", "no": "no"}
+
+    ham = {}
+    for raw, hedef in anahtarlar.items():
+        eslesen = []
+        for key, oranlar in odds_by_key.items():
+            if raw in key:
+                eslesen.extend(oranlar)
+        if eslesen:
+            eslesen.sort()
+            ham[hedef] = 1.0 / eslesen[len(eslesen)//2]
+
+    if len(ham) < 2:
+        return None
+
+    toplam = sum(ham.values())
+    if toplam <= 0:
+        return None
+    return {k: v / toplam * 100.0 for k, v in ham.items()}
+
+
 # ============================================================
 # POISSON
 # ============================================================
@@ -1561,13 +1628,34 @@ def poisson(
     )
 
 
-def poisson_mac_tahmini(home_lambda, away_lambda):
+def dixon_coles_tau(home_goals, away_goals, home_lambda, away_lambda, rho=-0.06):
+    """Düşük skorlu sonuçlarda klasik Poisson bağımsızlık varsayımını hafifçe düzeltir."""
+    h, a = int(home_goals), int(away_goals)
+    lh, la = float(home_lambda), float(away_lambda)
+    if h == 0 and a == 0:
+        return max(0.70, 1.0 - (lh * la * rho))
+    if h == 0 and a == 1:
+        return max(0.70, 1.0 + (lh * rho))
+    if h == 1 and a == 0:
+        return max(0.70, 1.0 + (la * rho))
+    if h == 1 and a == 1:
+        return max(0.70, 1.0 - rho)
+    return 1.0
 
+
+def poisson_mac_tahmini(home_lambda, away_lambda):
+    """Poisson + hafif Dixon-Coles düzeltmesi ile maç olasılıklarını üretir."""
     max_goal = 15
     ev_gol = {i: poisson(home_lambda, i) for i in range(max_goal + 1)}
     dep_gol = {i: poisson(away_lambda, i) for i in range(max_goal + 1)}
 
-    norm = sum(ev_gol.values()) * sum(dep_gol.values())
+    joint = {}
+    for h in range(max_goal + 1):
+        for a in range(max_goal + 1):
+            base = ev_gol[h] * dep_gol[a]
+            joint[(h, a)] = base * dixon_coles_tau(h, a, home_lambda, away_lambda)
+
+    norm = sum(joint.values())
     norm = norm if norm > 0 else 1.0
 
     ms1 = beraberlik = ms2 = 0.0
@@ -1575,30 +1663,28 @@ def poisson_mac_tahmini(home_lambda, away_lambda):
     kg = 0.0
     score_probs = {}
 
-    for h in range(max_goal + 1):
-        for a in range(max_goal + 1):
-            ol = (ev_gol[h] * dep_gol[a]) / norm
-            score_probs[(h, a)] = ol
+    for (h, a), base in joint.items():
+        ol = base / norm
+        score_probs[(h, a)] = ol
 
-            if h > a:
-                ms1 += ol
-            elif h == a:
-                beraberlik += ol
-            else:
-                ms2 += ol
+        if h > a:
+            ms1 += ol
+        elif h == a:
+            beraberlik += ol
+        else:
+            ms2 += ol
 
-            total = h + a
-            if total >= 1:
-                over05 += ol
-            if total >= 2:
-                over15 += ol
-            if total >= 3:
-                over25 += ol
-            if total >= 4:
-                over35 += ol
-
-            if h > 0 and a > 0:
-                kg += ol
+        total = h + a
+        if total >= 1:
+            over05 += ol
+        if total >= 2:
+            over15 += ol
+        if total >= 3:
+            over25 += ol
+        if total >= 4:
+            over35 += ol
+        if h > 0 and a > 0:
+            kg += ol
 
     total_lambda = max(0.0001, home_lambda + away_lambda)
     gol_olma = 1 - math.exp(-total_lambda)
@@ -1607,17 +1693,8 @@ def poisson_mac_tahmini(home_lambda, away_lambda):
     first_away = away_lambda / total_lambda * gol_olma
     no_goal = math.exp(-total_lambda)
 
-    tahmin_home, tahmin_away = max(
-        score_probs,
-        key=score_probs.get
-    )
-
-    # En olası 3 skor senaryosu
-    top_scores = sorted(
-        score_probs.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )[:3]
+    tahmin_home, tahmin_away = max(score_probs, key=score_probs.get)
+    top_scores = sorted(score_probs.items(), key=lambda x: x[1], reverse=True)[:3]
 
     return {
         "MS1": ms1 * 100,
@@ -1638,9 +1715,7 @@ def poisson_mac_tahmini(home_lambda, away_lambda):
         "NO_GOAL": no_goal * 100,
         "skor_home": tahmin_home,
         "skor_away": tahmin_away,
-        "TOP_SKORLAR": [
-            (h, a, p * 100) for (h, a), p in top_scores
-        ],
+        "TOP_SKORLAR": [(h, a, p * 100) for (h, a), p in top_scores],
         "TOTAL_LAMBDA": total_lambda,
         "HOME_LAMBDA": float(home_lambda),
         "AWAY_LAMBDA": float(away_lambda)
@@ -1807,355 +1882,206 @@ def _kalibre(olasilik, guc=1.0):
     return max(1.0, min(99.0, sonuc))
 
 
-
-def pazar_oran_sinyalleri(odds_parsed):
-    """API-Football oranlarını normalize edilmiş piyasa olasılığına çevirir.
-
-    Bahis oranı tek başına tahmin değildir; marjı normalize edilerek modele
-    düşük ağırlıklı bağımsız bir doğrulama sinyali olarak verilir.
-    """
-    sonuc = {}
-    if not odds_parsed:
-        return sonuc
-
-    def odd_num(v):
-        try:
-            x = float(str(v).replace(",", "."))
-            return x if x > 1.01 else None
-        except Exception:
-            return None
-
-    def normalize_pairs(pairs):
-        temiz = [(k, o) for k, o in pairs if o is not None]
-        if len(temiz) < 2:
-            return {}
-        raw = {k: 1.0 / o for k, o in temiz}
-        toplam = sum(raw.values())
-        if toplam <= 0:
-            return {}
-        return {k: raw[k] / toplam * 100.0 for k, _ in temiz}
-
-    for bet_name, values in odds_parsed.items():
-        name = str(bet_name or "").strip().lower()
-        if name in ("match winner", "1x2", "full time result", "match result"):
-            pairs = []
-            for item in values or []:
-                value = str(item.get("value") or "").strip().lower()
-                odd = odd_num(item.get("odd"))
-                if value in ("home", "1"):
-                    pairs.append(("home", odd))
-                elif value in ("draw", "x", "tie"):
-                    pairs.append(("draw", odd))
-                elif value in ("away", "2"):
-                    pairs.append(("away", odd))
-            norm = normalize_pairs(pairs)
-            if norm:
-                sonuc["MS1"] = norm.get("home")
-                sonuc["X"] = norm.get("draw")
-                sonuc["MS2"] = norm.get("away")
-
-        elif "goals over/under" in name or name in ("over/under", "total goals"):
-            for item in values or []:
-                value = str(item.get("value") or "").strip().lower()
-                odd = odd_num(item.get("odd"))
-                if odd is None:
-                    continue
-                if "over 1.5" in value or "over1.5" in value:
-                    sonuc["OVER15"] = 100.0 / odd
-                elif "under 1.5" in value or "under1.5" in value:
-                    sonuc["UNDER15"] = 100.0 / odd
-                elif "over 2.5" in value or "over2.5" in value:
-                    sonuc["OVER25"] = 100.0 / odd
-                elif "under 2.5" in value or "under2.5" in value:
-                    sonuc["UNDER25"] = 100.0 / odd
-                elif "over 3.5" in value or "over3.5" in value:
-                    sonuc["OVER35"] = 100.0 / odd
-                elif "under 3.5" in value or "under3.5" in value:
-                    sonuc["UNDER35"] = 100.0 / odd
-
-        elif "both teams score" in name or "both teams to score" in name:
-            for item in values or []:
-                value = str(item.get("value") or "").strip().lower()
-                odd = odd_num(item.get("odd"))
-                if odd is None:
-                    continue
-                if value in ("yes", "both teams to score - yes", "btts - yes"):
-                    sonuc["KG"] = 100.0 / odd
-                elif value in ("no", "both teams to score - no", "btts - no"):
-                    sonuc["KG_YOK"] = 100.0 / odd
-
-    # O/U ve KG çiftlerini kendi marjları üzerinden normalize et.
-    for ust, alt in (("OVER15", "UNDER15"), ("OVER25", "UNDER25"),
-                     ("OVER35", "UNDER35"), ("KG", "KG_YOK")):
-        a, b = sonuc.get(ust), sonuc.get(alt)
-        if a is not None and b is not None and (a + b) > 0:
-            toplam = a + b
-            sonuc[ust] = a / toplam * 100.0
-            sonuc[alt] = b / toplam * 100.0
-
-    return sonuc
-
-
 def gelistirilmis_model(poisson_sonuc, home_form, away_form,
-                         home_venue, away_venue, prediction, h2h,
-                         odds_parsed=None, standings=None,
-                         home_id=None, away_id=None):
-    """V6 çok kaynaklı maç modeli.
+                        home_venue, away_venue, prediction, h2h, odds_parsed=None):
+    """Çok kaynaklı ve adaptif maç modeli.
 
-    Omurga:
-    - Poisson: gol dağılımının matematiksel ana modeli.
-    - Son form: yakın dönem performansı.
-    - Ev/deplasman: maç bağlamını düzeltir.
-    - API-Football tahmini: bağımsız ek sinyal.
-    - H2H: düşük ağırlıklı geçmiş karşılaştırma.
-    - Oranlar: yalnızca normalize edilmiş piyasa sinyali olarak düşük ağırlık.
-    - Kaynak uyumu: birbirinden uzak kaynaklarda güven azaltılır.
+    Model olasılıkları yapay biçimde yükseltmez. Bunun yerine:
+    - Poisson ana omurgayı oluşturur.
+    - Son form ve saha formu güncel veriyi ekler.
+    - API-Football tahmini bağımsız doğrulama olarak kullanılır.
+    - Kaynaklar birbirinden çok ayrışıyorsa sonuç 50'ye doğru kalibre edilir.
+    - Kaynaklar birbirine yakınsa modelin güçlü sinyali daha fazla korunur.
     """
     p = dict(poisson_sonuc)
-    odds_signal = pazar_oran_sinyalleri(odds_parsed or {})
 
-    def num(v, default=None):
+    def oran(veri, anahtar, varsayilan=None):
+        deger = veri.get(anahtar)
+        if deger is None:
+            return varsayilan
         try:
-            if v is None:
-                return default
-            return float(v)
+            return float(deger)
         except Exception:
-            return default
+            return varsayilan
 
-    def pct_from_count(count, games):
-        if games and games > 0:
-            return num(count, 0.0) / games * 100.0
-        return None
+    def ortalama_gecerli(degerler, varsayilan):
+        temiz = [float(x) for x in degerler if x is not None]
+        return sum(temiz) / len(temiz) if temiz else varsayilan
 
-    def valid(vals):
-        return [float(v) for v in vals if v is not None and math.isfinite(float(v))]
-
-    def weighted_average(items):
-        clean = [(float(v), float(w)) for v, w in items
-                 if v is not None and w > 0 and math.isfinite(float(v))]
-        if not clean:
-            return None
-        return sum(v * w for v, w in clean) / sum(w for _, w in clean)
-
-    def agreement(values):
-        vals = valid(values)
-        if len(vals) < 2:
+    def uyum_kalibrasyonu(kaynaklar):
+        """Kaynaklar arasındaki fark büyüdükçe güveni azaltır."""
+        temiz = [float(x) for x in kaynaklar if x is not None]
+        if len(temiz) < 2:
             return 0.88
-        spread = max(vals) - min(vals)
-        # Kaynaklar birbirine yaklaştıkça modelin dış sinyale güveni artar.
-        if spread <= 5:
-            return 0.99
-        if spread <= 10:
+        fark = max(temiz) - min(temiz)
+        if fark <= 6:
             return 0.96
-        if spread <= 15:
-            return 0.92
-        if spread <= 22:
-            return 0.87
-        if spread <= 30:
-            return 0.80
-        return 0.72
+        if fark <= 12:
+            return 0.93
+        if fark <= 20:
+            return 0.88
+        if fark <= 30:
+            return 0.82
+        return 0.74
 
-    def shrink_to_neutral(prob, confidence):
-        if prob is None:
-            return None
-        p0 = max(1.0, min(99.0, float(prob)))
-        c = max(0.55, min(1.0, float(confidence)))
-        return max(1.0, min(99.0, 50.0 + (p0 - 50.0) * c))
+    # ========================================================
+    # MAÇ SONUCU: POISSON + SAHA + FORM + API
+    # ========================================================
+    hv_games = max(0, int(home_venue.get("mac", 0) or 0))
+    av_games = max(0, int(away_venue.get("mac", 0) or 0))
+    hf_games = max(0, int(home_form.get("mac", 0) or 0))
+    af_games = max(0, int(away_form.get("mac", 0) or 0))
 
-    hf_n = max(0, int(num(home_form.get("mac"), 0)))
-    af_n = max(0, int(num(away_form.get("mac"), 0)))
-    hv_n = max(0, int(num(home_venue.get("mac"), 0)))
-    av_n = max(0, int(num(away_venue.get("mac"), 0)))
+    hv_win = oran(home_venue, "G", 0) / hv_games * 100 if hv_games else None
+    hv_draw = oran(home_venue, "B", 0) / hv_games * 100 if hv_games else None
+    hv_loss = oran(home_venue, "M", 0) / hv_games * 100 if hv_games else None
+    av_win = oran(away_venue, "G", 0) / av_games * 100 if av_games else None
+    av_draw = oran(away_venue, "B", 0) / av_games * 100 if av_games else None
+    av_loss = oran(away_venue, "M", 0) / av_games * 100 if av_games else None
 
-    # ------------------------------------------------------------
-    # MAÇ SONUCU
-    # ------------------------------------------------------------
-    hv1 = pct_from_count(home_venue.get("G"), hv_n)
-    hvx = pct_from_count(home_venue.get("B"), hv_n)
-    hv2 = pct_from_count(home_venue.get("M"), hv_n)
+    hf_win = oran(home_form, "G", 0) / hf_games * 100 if hf_games else None
+    hf_draw = oran(home_form, "B", 0) / hf_games * 100 if hf_games else None
+    hf_loss = oran(home_form, "M", 0) / hf_games * 100 if hf_games else None
+    af_win = oran(away_form, "G", 0) / af_games * 100 if af_games else None
+    af_draw = oran(away_form, "B", 0) / af_games * 100 if af_games else None
+    af_loss = oran(away_form, "M", 0) / af_games * 100 if af_games else None
 
-    av1 = pct_from_count(away_venue.get("M"), av_n)  # ev için MS1 sinyali
-    avx = pct_from_count(away_venue.get("B"), av_n)
-    av2 = pct_from_count(away_venue.get("G"), av_n)  # deplasman için MS2
+    ms1_sources = [p["MS1"]]
+    msx_sources = [p["X"]]
+    ms2_sources = [p["MS2"]]
 
-    hf1 = pct_from_count(home_form.get("G"), hf_n)
-    hfx = pct_from_count(home_form.get("B"), hf_n)
-    hf2 = pct_from_count(home_form.get("M"), hf_n)
+    for hedef, degerler in (
+        (ms1_sources, [hv_win, av_loss, hf_win, af_loss]),
+        (msx_sources, [hv_draw, av_draw, hf_draw, af_draw]),
+        (ms2_sources, [hv_loss, av_win, hf_loss, af_win]),
+    ):
+        hedef.extend(x for x in degerler if x is not None)
 
-    af1 = pct_from_count(away_form.get("M"), af_n)
-    afx = pct_from_count(away_form.get("B"), af_n)
-    af2 = pct_from_count(away_form.get("G"), af_n)
+    # Form tarafına son maçların ağırlıklı oranı da dahil edilir.
+    if hf_games and af_games:
+        ms1_sources.append(ortalama_gecerli([
+            home_form.get("W_RESULT_HOME"),
+            away_form.get("W_RESULT_AWAY")
+        ], (hf_win or p["MS1"])))
 
-    ms1_sources = [p.get("MS1"), hv1, av1, hf1, af1]
-    msx_sources = [p.get("X"), hvx, avx, hfx, afx]
-    ms2_sources = [p.get("MS2"), hv2, av2, hf2, af2]
-    h2h_ms1 = h2h_msx = h2h_ms2 = None
+    ms1 = sum(ms1_sources) / len(ms1_sources)
+    msx = sum(msx_sources) / len(msx_sources)
+    ms2 = sum(ms2_sources) / len(ms2_sources)
 
-    # H2H düşük ağırlıklı bir doğrulama kaynağıdır; eski maçların etkisini sınırlıyoruz.
-    if h2h and home_id is not None and away_id is not None:
-        h1 = hx = h2 = 0
-        hn = 0
-        for match in (h2h or [])[:8]:
-            try:
-                mh = match.get("teams", {}).get("home", {}).get("id")
-                ma = match.get("teams", {}).get("away", {}).get("id")
-                gh = match.get("goals", {}).get("home")
-                ga = match.get("goals", {}).get("away")
-                if gh is None or ga is None:
-                    continue
-                if mh == home_id and ma == away_id:
-                    hn += 1
-                    if gh > ga: h1 += 1
-                    elif gh == ga: hx += 1
-                    else: h2 += 1
-                elif mh == away_id and ma == home_id:
-                    hn += 1
-                    if ga > gh: h1 += 1
-                    elif ga == gh: hx += 1
-                    else: h2 += 1
-            except Exception:
-                continue
-        if hn:
-            h2h_ms1 = h1 / hn * 100.0
-            h2h_msx = hx / hn * 100.0
-            h2h_ms2 = h2 / hn * 100.0
-            ms1_sources.append(h2h_ms1)
-            msx_sources.append(h2h_msx)
-            ms2_sources.append(h2h_ms2)
-
-    # API-Football prediction
     if prediction:
         pred = prediction.get("predictions", {}) or {}
-        per = pred.get("percent", {}) or {}
-        api1 = _yuzde_sayi(per.get("home"))
-        apix = _yuzde_sayi(per.get("draw"))
-        api2 = _yuzde_sayi(per.get("away"))
-        if api1 is not None: ms1_sources.append(api1)
-        if apix is not None: msx_sources.append(apix)
-        if api2 is not None: ms2_sources.append(api2)
+        percent = pred.get("percent", {}) or {}
+        api_home = _yuzde_sayi(percent.get("home"))
+        api_draw = _yuzde_sayi(percent.get("draw"))
+        api_away = _yuzde_sayi(percent.get("away"))
+        api_agirlik = 0.18
+        if api_home is not None:
+            ms1_sources.append(api_home)
+            ms1 = ms1 * (1 - api_agirlik) + api_home * api_agirlik
+        if api_draw is not None:
+            msx_sources.append(api_draw)
+            msx = msx * (1 - api_agirlik) + api_draw * api_agirlik
+        if api_away is not None:
+            ms2_sources.append(api_away)
+            ms2 = ms2 * (1 - api_agirlik) + api_away * api_agirlik
 
-    if odds_signal.get("MS1") is not None:
-        ms1_sources.append(odds_signal["MS1"])
-    if odds_signal.get("X") is not None:
-        msx_sources.append(odds_signal["X"])
-    if odds_signal.get("MS2") is not None:
-        ms2_sources.append(odds_signal["MS2"])
+    # Piyasa oranlarını bağımsız bir doğrulama kaynağı olarak ekle.
+    # Oran marjı normalize edildiği için doğrudan bookmaker yüzdesi kullanılmaz.
+    piyasa_ms = oran_pazar_olasiligi(odds_parsed, "ms")
+    if piyasa_ms:
+        piyasa_agirlik = 0.16
+        if "home" in piyasa_ms:
+            ms1 = ms1 * (1 - piyasa_agirlik) + piyasa_ms["home"] * piyasa_agirlik
+            ms1_sources.append(piyasa_ms["home"])
+        if "draw" in piyasa_ms:
+            msx = msx * (1 - piyasa_agirlik) + piyasa_ms["draw"] * piyasa_agirlik
+            msx_sources.append(piyasa_ms["draw"])
+        if "away" in piyasa_ms:
+            ms2 = ms2 * (1 - piyasa_agirlik) + piyasa_ms["away"] * piyasa_agirlik
+            ms2_sources.append(piyasa_ms["away"])
 
-    # Kaynak ağırlıkları: Poisson ana gövde, form/saha yakın dönem,
-    # API + oran düşük ağırlıklı bağımsız kontrol.
-    def result_model(base, sources, venue_a, venue_b, form_a, form_b, api_key, odds_key):
-        items = [(base, 0.48)]
-        for v in (venue_a, venue_b):
-            if v is not None: items.append((v, 0.11))
-        for v in (form_a, form_b):
-            if v is not None: items.append((v, 0.10))
-        if prediction:
-            api_v = odds_signal.get(api_key) if api_key.startswith("ODD") else None
-        # Son iki kaynak ayrıca açıkça ekleniyor.
-        api_val = None
-        if prediction:
-            per = prediction.get("predictions", {}) or {}
-            api_val = _yuzde_sayi((per.get("percent", {}) or {}).get(
-                {"MS1":"home","X":"draw","MS2":"away"}.get(api_key, "home")
-            ))
-        if api_val is not None: items.append((api_val, 0.08))
-        odd_val = odds_signal.get({"MS1":"MS1","X":"X","MS2":"MS2"}.get(api_key))
-        if odd_val is not None: items.append((odd_val, 0.04))
-        # H2H dahil edilmişse son kaynağı düşük ağırlıkla destek olarak kullan.
-        h2h_map = {"MS1": h2h_ms1, "X": h2h_msx, "MS2": h2h_ms2}
-        h2h_val = h2h_map.get(api_key)
-        if h2h_val is not None:
-            items.append((h2h_val, 0.05))
-        return weighted_average(items) or base
+    ms_toplam = max(0.001, ms1 + msx + ms2)
+    ms1 = ms1 / ms_toplam * 100
+    msx = msx / ms_toplam * 100
+    ms2 = ms2 / ms_toplam * 100
 
-    ms1 = result_model(p.get("MS1", 33.3), ms1_sources, hv1, av1, hf1, af1, "MS1", "MS1")
-    msx = result_model(p.get("X", 33.3), msx_sources, hvx, avx, hfx, afx, "X", "X")
-    ms2 = result_model(p.get("MS2", 33.3), ms2_sources, hv2, av2, hf2, af2, "MS2", "MS2")
+    # ========================================================
+    # GOL PAZARLARI: GÜNCEL FORM + POISSON + PİYASA
+    # ========================================================
+    kg_emp = ortalama_gecerli([
+        home_form.get("W_KG"), away_form.get("W_KG"),
+        home_form.get("KG"), away_form.get("KG")
+    ], p["KG"])
+    over15_emp = ortalama_gecerli([
+        home_form.get("W_OVER15"), away_form.get("W_OVER15"),
+        home_form.get("OVER15"), away_form.get("OVER15")
+    ], p["OVER15"])
+    over25_emp = ortalama_gecerli([
+        home_form.get("W_OVER25"), away_form.get("W_OVER25"),
+        home_form.get("OVER25"), away_form.get("OVER25")
+    ], p["OVER25"])
 
-    # 1X2 daima 100'e normalize edilir.
-    ms_sum = max(0.001, ms1 + msx + ms2)
-    ms1, msx, ms2 = ms1 / ms_sum * 100, msx / ms_sum * 100, ms2 / ms_sum * 100
+    # Ev/deplasman gol ortalamalarını da küçük bir doğrulama sinyali yap.
+    gol_form_15 = None
+    gol_form_25 = None
+    if hf_games and af_games:
+        toplam_gol_ort = (
+            float(home_form.get("AVG_GF", 0)) + float(home_form.get("AVG_GA", 0)) +
+            float(away_form.get("AVG_GF", 0)) + float(away_form.get("AVG_GA", 0))
+        ) / 2.0
+        # Basit ampirik dönüşüm: yüksek toplam gol ortalaması üst pazarını destekler.
+        gol_form_15 = max(35.0, min(95.0, 50.0 + (toplam_gol_ort - 2.0) * 18.0))
+        gol_form_25 = max(30.0, min(90.0, 50.0 + (toplam_gol_ort - 2.2) * 16.0))
 
-    conf_ms1 = agreement(ms1_sources)
-    conf_msx = agreement(msx_sources)
-    conf_ms2 = agreement(ms2_sources)
+    over15_sources = [p["OVER15"], over15_emp]
+    if gol_form_15 is not None:
+        over15_sources.append(gol_form_15)
+    over25_sources = [p["OVER25"], over25_emp]
+    if gol_form_25 is not None:
+        over25_sources.append(gol_form_25)
+    kg_sources = [p["KG"], kg_emp]
 
-    p["MS1"] = shrink_to_neutral(ms1, conf_ms1)
-    p["X"] = shrink_to_neutral(msx, conf_msx)
-    p["MS2"] = shrink_to_neutral(ms2, conf_ms2)
+    piyasa_ou25 = oran_pazar_olasiligi(odds_parsed, "ou25")
+    if piyasa_ou25 and "over" in piyasa_ou25:
+        over25_sources.append(piyasa_ou25["over"])
+    piyasa_btts = oran_pazar_olasiligi(odds_parsed, "btts")
+    if piyasa_btts and "yes" in piyasa_btts:
+        kg_sources.append(piyasa_btts["yes"])
 
-    ms_sum = p["MS1"] + p["X"] + p["MS2"]
-    p["MS1"] = p["MS1"] / ms_sum * 100
-    p["X"] = p["X"] / ms_sum * 100
-    p["MS2"] = p["MS2"] / ms_sum * 100
+    p["MS1"] = _kalibre(ms1, uyum_kalibrasyonu(ms1_sources))
+    p["X"] = _kalibre(msx, uyum_kalibrasyonu(msx_sources))
+    p["MS2"] = _kalibre(ms2, uyum_kalibrasyonu(ms2_sources))
 
-    # ------------------------------------------------------------
-    # GOL PAZARLARI
-    # ------------------------------------------------------------
-    kg_emp = weighted_average([
-        (home_form.get("W_KG"), 0.40),
-        (away_form.get("W_KG"), 0.40),
-        (home_form.get("KG"), 0.10),
-        (away_form.get("KG"), 0.10),
-    ])
-    over15_emp = weighted_average([
-        (home_form.get("W_OVER15"), 0.40),
-        (away_form.get("W_OVER15"), 0.40),
-        (home_form.get("OVER15"), 0.10),
-        (away_form.get("OVER15"), 0.10),
-    ])
-    over25_emp = weighted_average([
-        (home_form.get("W_OVER25"), 0.40),
-        (away_form.get("W_OVER25"), 0.40),
-        (home_form.get("OVER25"), 0.10),
-        (away_form.get("OVER25"), 0.10),
-    ])
+    over15_mix = sum(over15_sources) / len(over15_sources)
+    over25_mix = sum(over25_sources) / len(over25_sources)
+    kg_mix = sum(kg_sources) / len(kg_sources)
 
-    def market_mix(base, empirical, odd_value=None):
-        items = [(base, 0.58)]
-        if empirical is not None: items.append((empirical, 0.27))
-        if odd_value is not None: items.append((odd_value, 0.15))
-        return weighted_average(items) or base
-
-    over15 = market_mix(p["OVER15"], over15_emp, odds_signal.get("OVER15"))
-    over25 = market_mix(p["OVER25"], over25_emp, odds_signal.get("OVER25"))
-    kg = market_mix(p["KG"], kg_emp, odds_signal.get("KG"))
-
-    p["OVER15"] = shrink_to_neutral(over15, agreement([p["OVER15"], over15_emp, odds_signal.get("OVER15")]))
-    p["OVER25"] = shrink_to_neutral(over25, agreement([p["OVER25"], over25_emp, odds_signal.get("OVER25")]))
-    p["KG"] = shrink_to_neutral(kg, agreement([p["KG"], kg_emp, odds_signal.get("KG")]))
-
-    # Pazar mantığı: üst çizgileri monotonic olmalı.
-    p["OVER05"] = max(float(p.get("OVER05", 0)), p["OVER15"])
-    p["OVER15"] = min(p["OVER15"], p["OVER05"])
-    p["OVER25"] = min(p["OVER25"], p["OVER15"])
-    p["OVER35"] = min(float(p.get("OVER35", 50.0)), p["OVER25"])
-    p["UNDER05"] = 100 - p["OVER05"]
+    p["OVER15"] = _kalibre(over15_mix, uyum_kalibrasyonu(over15_sources))
     p["UNDER15"] = 100 - p["OVER15"]
+    p["OVER25"] = _kalibre(over25_mix, uyum_kalibrasyonu(over25_sources))
     p["UNDER25"] = 100 - p["OVER25"]
-    p["UNDER35"] = 100 - p["OVER35"]
+    p["KG"] = _kalibre(kg_mix, uyum_kalibrasyonu(kg_sources))
     p["KG_YOK"] = 100 - p["KG"]
 
-    # 3.5 üst, ilk gol ve ilk yarı dışındaki tekil modelleri kontrollü tut.
-    p["OVER35"] = shrink_to_neutral(p["OVER35"], agreement([poisson_sonuc.get("OVER35"), odds_signal.get("OVER35")]))
-    # Aynı gol dağılımının mantığını koru: daha yüksek çizgi, daha yüksek
-    # çizginin üst olasılığından büyük olamaz.
-    p["OVER35"] = min(p["OVER35"], p["OVER25"])
-    p["OVER25"] = min(p["OVER25"], p["OVER15"])
-    p["OVER15"] = min(p["OVER15"], p["OVER05"])
-    p["UNDER05"] = 100 - p["OVER05"]
-    p["UNDER15"] = 100 - p["OVER15"]
-    p["UNDER25"] = 100 - p["OVER25"]
+    # 3.5 üstte yalnızca Poisson kullanılır; yüksek skor senaryolarını abartmamak için
+    # daha sıkı kalibrasyon uygulanır.
+    p["OVER35"] = _kalibre(p["OVER35"], 0.80)
     p["UNDER35"] = 100 - p["OVER35"]
-    p["FIRST_HOME"] = shrink_to_neutral(p.get("FIRST_HOME", 50.0), 0.88)
-    p["FIRST_AWAY"] = shrink_to_neutral(p.get("FIRST_AWAY", 50.0), 0.88)
-    p["NO_GOAL"] = shrink_to_neutral(p.get("NO_GOAL", 20.0), 0.88)
+    p["FIRST_HOME"] = _kalibre(p["FIRST_HOME"], 0.82)
+    p["FIRST_AWAY"] = _kalibre(p["FIRST_AWAY"], 0.82)
+    p["NO_GOAL"] = _kalibre(p["NO_GOAL"], 0.82)
 
-    # ------------------------------------------------------------
-    # MODEL DESTEK / GÜVEN BİLGİSİ
-    # ------------------------------------------------------------
+    # MS yüzdelerini tekrar 100'e normalize et.
+    ms_sum = p["MS1"] + p["X"] + p["MS2"]
+    if ms_sum > 0:
+        p["MS1"] = p["MS1"] / ms_sum * 100
+        p["X"] = p["X"] / ms_sum * 100
+        p["MS2"] = p["MS2"] / ms_sum * 100
+
+    # Kaynakların aynı yönde olup olmadığını ayrıca sakla.
+    # Bu değer olasılığı şişirmek için değil, sinyal kalitesini ölçmek içindir.
     def destek(veriler, hedef):
-        temiz = valid(veriler)
+        temiz = [float(x) for x in veriler if x is not None]
         if not temiz:
             return (0, 0)
         if hedef >= 50:
@@ -2166,18 +2092,13 @@ def gelistirilmis_model(poisson_sonuc, home_form, away_form,
         "MS1": destek(ms1_sources, p["MS1"]),
         "X": destek(msx_sources, p["X"]),
         "MS2": destek(ms2_sources, p["MS2"]),
-        "OVER15": destek([p["OVER15"], over15_emp, odds_signal.get("OVER15")], p["OVER15"]),
-        "OVER25": destek([p["OVER25"], over25_emp, odds_signal.get("OVER25")], p["OVER25"]),
-        "KG": destek([p["KG"], kg_emp, odds_signal.get("KG")], p["KG"]),
-        "OVER35": destek([p.get("OVER35"), odds_signal.get("OVER35")], p["OVER35"]),
+        "OVER15": destek(over15_sources, p["OVER15"]),
+        "OVER25": destek(over25_sources, p["OVER25"]),
+        "KG": destek(kg_sources, p["KG"]),
+        "OVER35": (1, 1),
         "FIRST_HOME": (1, 1),
         "FIRST_AWAY": (1, 1),
     }
-
-    # Genel veri uyumu; yüzdeyi yükseltmek için değil, UI'da kalite sinyali için.
-    conf_values = [conf_ms1, conf_msx, conf_ms2]
-    p["VERI_UYUMU"] = sum(conf_values) / len(conf_values) * 100.0
-    p["MODEL_VERSIYON"] = "V6"
 
     return p
 
@@ -2254,9 +2175,7 @@ def ilk_yari_gol_modeli(home_form, away_form, home_lambda, away_lambda):
 def market_onerileri_olustur(poisson_sonuc, home_corner, away_corner,
                              home_name, away_name, home_form=None,
                              away_form=None, home_venue=None,
-                             away_venue=None, prediction=None, h2h=None,
-                             home_cards=None, away_cards=None, odds_parsed=None,
-                             standings=None, home_id=None, away_id=None):
+                             away_venue=None, prediction=None, h2h=None, home_cards=None, away_cards=None):
     """Tüm pazarları çoklu veri kaynağı + model uyumu ile sıralar."""
 
     home_form = home_form or {"mac": 0}
@@ -2266,8 +2185,7 @@ def market_onerileri_olustur(poisson_sonuc, home_corner, away_corner,
 
     model = gelistirilmis_model(
         poisson_sonuc, home_form, away_form, home_venue,
-        away_venue, prediction, h2h, odds_parsed,
-        standings, home_id, away_id
+        away_venue, prediction, h2h
     )
 
     destek = model.get("DESTEK", {})
@@ -2546,15 +2464,29 @@ def analiz_mac_web(mac):
             + home_venue_ga * 0.10
         )
 
+        # API-Football tahminindeki beklenen gol değerini bağımsız doğrulama
+        # olarak düşük ağırlıkla kullan. Veri yoksa mevcut model aynen devam eder.
+        if prediction:
+            pred_data = prediction.get("predictions", {}) or {}
+            pred_goals = prediction.get("goals", {}) or pred_data.get("goals", {}) or {}
+            api_hg = _yuzde_sayi(pred_goals.get("home"))
+            api_ag = _yuzde_sayi(pred_goals.get("away"))
+            if api_hg is not None and 0.05 <= api_hg <= 5.5:
+                home_lambda = home_lambda * 0.84 + api_hg * 0.16
+            if api_ag is not None and 0.05 <= api_ag <= 5.5:
+                away_lambda = away_lambda * 0.84 + api_ag * 0.16
+
         # Aşırı uçları sınırlandır.
         home_lambda = max(0.15, min(home_lambda, 4.20))
         away_lambda = max(0.15, min(away_lambda, 4.20))
 
-        poisson_sonuc = (
-            poisson_mac_tahmini(
-                home_lambda,
-                away_lambda
-            )
+        poisson_sonuc = poisson_mac_tahmini(home_lambda, away_lambda)
+
+        # Önce birleşik modeli hesapla, ardından market listesine bu son
+        # kalibre edilmiş olasılıkları ver. Böylece UI ile öneri listesi aynı modeli kullanır.
+        poisson_sonuc = gelistirilmis_model(
+            poisson_sonuc, home_form, away_form, home_venue,
+            away_venue, prediction, h2h, odds_parsed
         )
 
         marketler = market_onerileri_olustur(
@@ -2570,19 +2502,7 @@ def analiz_mac_web(mac):
             prediction,
             h2h,
             home_cards,
-            away_cards,
-            odds_parsed,
-            standings,
-            home_id,
-            away_id
-        )
-
-        # Ekranda gösterilen Poisson değerleri de birleşik model ile
-        # aynı olsun; böylece üstteki özet ile alttaki bölüm çelişmez.
-        poisson_sonuc = gelistirilmis_model(
-            poisson_sonuc, home_form, away_form, home_venue,
-            away_venue, prediction, h2h,
-            odds_parsed, standings, home_id, away_id
+            away_cards
         )
 
         # ====================================================
