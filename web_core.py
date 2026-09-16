@@ -34,10 +34,23 @@ BORDER = "#263852"
 WHITE = "#ffffff"
 
 
+def _streamlit_secret_oku():
+    """Streamlit Community Cloud Secrets içinden API anahtarını güvenli biçimde okur."""
+    try:
+        import streamlit as st
+        anahtar = st.secrets.get("API_FOOTBALL_KEY", "")
+        return str(anahtar).strip() if anahtar else ""
+    except Exception:
+        return ""
+
+
 def api_anahtari_yukle():
-    """Web sürümü için API anahtarını ortam değişkeni veya api_key.txt dosyasından alır.
-    Streamlit sunucusunda GUI/Tkinter penceresi açmaz.
-    """
+    """API anahtarını sırasıyla Streamlit Secrets, ortam değişkeni veya dosyadan alır."""
+    # Streamlit Cloud için öncelik Secrets'tadır.
+    anahtar = _streamlit_secret_oku()
+    if anahtar:
+        return anahtar
+
     anahtar = (os.getenv("API_FOOTBALL_KEY") or "").strip()
     if anahtar:
         return anahtar
@@ -77,7 +90,11 @@ def _anahtar_dosyasi():
 
 
 def _anahtar_oku():
-    """Anahtarı ortam değişkeninden veya api_key.txt dosyasından yeniden okur."""
+    """Anahtarı Streamlit Secrets, ortam değişkeni veya api_key.txt dosyasından yeniden okur."""
+    anahtar = _streamlit_secret_oku()
+    if anahtar:
+        return anahtar
+
     anahtar = (os.getenv("API_FOOTBALL_KEY") or "").strip()
     if anahtar:
         return anahtar
