@@ -1960,15 +1960,27 @@ def gelistirilmis_model(poisson_sonuc, home_form, away_form,
     kg_mix = sum(kg_sources) / len(kg_sources)
 
     p["OVER15"] = _kalibre(over15_mix, uyum_kalibrasyonu(over15_sources))
-    p["UNDER15"] = 100 - p["OVER15"]
     p["OVER25"] = _kalibre(over25_mix, uyum_kalibrasyonu(over25_sources))
+
+    # Aynı toplam gol dağılımından gelen çizgiler matematiksel olarak
+    # monoton olmalıdır: 1.5 Üst >= 2.5 Üst >= 3.5 Üst.
+    # Farklı veri kaynakları ters yönde sinyal verse bile bu düzen bozulmaz.
+    p["OVER35"] = _kalibre(p["OVER35"], 0.80)
+    p["OVER25"] = max(p["OVER25"], p["OVER35"])
+    p["OVER15"] = max(p["OVER15"], p["OVER25"])
+
+    # Aşırı yüksek değerleri yuvarlamada 100 görünmemesi için üst sınır.
+    p["OVER15"] = min(98.5, max(1.5, p["OVER15"]))
+    p["OVER25"] = min(98.0, max(1.0, p["OVER25"]))
+    p["OVER35"] = min(96.5, max(0.5, p["OVER35"]))
+
+    p["UNDER15"] = 100 - p["OVER15"]
     p["UNDER25"] = 100 - p["OVER25"]
     p["KG"] = _kalibre(kg_mix, uyum_kalibrasyonu(kg_sources))
     p["KG_YOK"] = 100 - p["KG"]
 
     # 3.5 üstte yalnızca Poisson kullanılır; yüksek skor senaryolarını abartmamak için
     # daha sıkı kalibrasyon uygulanır.
-    p["OVER35"] = _kalibre(p["OVER35"], 0.80)
     p["UNDER35"] = 100 - p["OVER35"]
     p["FIRST_HOME"] = _kalibre(p["FIRST_HOME"], 0.82)
     p["FIRST_AWAY"] = _kalibre(p["FIRST_AWAY"], 0.82)
@@ -2464,6 +2476,9 @@ def analiz_mac_web(mac):
             "Model: Poisson + son form + saha formu + API tahmini + H2H + kalibrasyon"
         )
         satirlar.append(
+            "Kalibrasyon: 1.5 Üst ≥ 2.5 Üst ≥ 3.5 Üst; aşırı güven azaltılır."
+        )
+        satirlar.append(
             "Not: Yüksek yüzde garanti değildir; model özellikle aşırı yüksek tahminleri kalibre eder."
         )
         satirlar.append("")
@@ -2505,7 +2520,7 @@ def analiz_mac_web(mac):
         )
 
         satirlar.append(
-            f"   2.5 Üst: "
+            f"   Son maçlarda 2.5 Üst: "
             f"{home_form['OVER25']:.1f}%"
         )
 
@@ -2563,7 +2578,7 @@ def analiz_mac_web(mac):
         )
 
         satirlar.append(
-            f"   2.5 Üst: "
+            f"   Son maçlarda 2.5 Üst: "
             f"{away_form['OVER25']:.1f}%"
         )
 
